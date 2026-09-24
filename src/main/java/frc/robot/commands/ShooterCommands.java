@@ -7,6 +7,7 @@ import edu.wpi.first.math.geometry.Pose3d;
 import edu.wpi.first.math.geometry.Rotation2d;
 import edu.wpi.first.math.geometry.Rotation3d;
 import edu.wpi.first.math.geometry.Transform3d;
+import edu.wpi.first.math.kinematics.ChassisSpeeds;
 import edu.wpi.first.wpilibj.DriverStation;
 import edu.wpi.first.wpilibj.DriverStation.Alliance;
 import edu.wpi.first.wpilibj2.command.Command;
@@ -63,20 +64,19 @@ public class ShooterCommands {
           new Rotation2d());
 
   /**
-   * Calculates required flywheel RPS for a given hood angle.
+   * Calculates the required ball exit velocity (ft/s) for a given horizontal distance and hood
+   * angle, using the same projectile-motion solve as {@link #calculateShooterRPS}. Shared so the
+   * shoot-on-the-move flight-time estimate stays consistent with the actual shot.
    *
    * @param xs Horizontal distance to target in feet
-   * @param thetaDegrees Hood angle in degrees (e.g. 65.0)
-   * @return Required flywheel speed in Rotations Per Second (RPS)
+   * @param thetaDegrees Hood angle in degrees
+   * @return Required ball exit velocity in ft/s, or 0.0 if the shot is not physically achievable
    */
-  public static double calculateShooterRPS(double xs, double thetaDegrees) {
-    // 1. Physical Constants
+  private static double calculateExitVelocityFps(double xs, double thetaDegrees) {
     double g = 32.2; // Gravity (ft/s^2)
     double thetaRad = Math.toRadians(thetaDegrees);
     double h = 4.11776908; // Target Height (6) - Launch Height (1.88223092)
-    double wheelDiameter = 4.0 / 12.0; // 4 inch wheel converted to feet
 
-    // 2. Calculate Required Ball Exit Velocity (v)
     double cosTheta = Math.cos(thetaRad);
     double tanTheta = Math.tan(thetaRad);
 
@@ -85,7 +85,75 @@ public class ShooterCommands {
 
     if (denominator <= 0) return 0.0; // Distance/angle combination is physically impossible
 
-    double vBall = Math.sqrt(numerator / denominator); // Linear ft/s
+    return Math.sqrt(numerator / denominator);
+  }
+
+  /**
+   * Estimates ball flight time (seconds) for a horizontal distance and hood angle, using the
+   * horizontal component of the exit velocity computed in {@link #calculateExitVelocityFps}.
+   *
+   * @param xs Horizontal distance to target in feet
+   * @param thetaDegrees Hood angle in degrees
+   * @return Flight time in seconds, or 0.0 if the shot is not physically achievable
+   */
+  public static double estimateFlightTimeSeconds(double xs, double thetaDegrees) {
+    double vBall = calculateExitVelocityFps(xs, thetaDegrees);
+    if (vBall <= 0) return 0.0;
+    double horizontalVel = vBall * Math.cos(Math.toRadians(thetaDegrees));
+    if (horizontalVel <= 0) return 0.0;
+    return xs / horizontalVel;
+  }
+
+  /**
+   * Computes a "virtual" hub pose that compensates for robot velocity while shooting on the move.
+   * Aiming at this point (and setting flywheel/hood for the distance to it) instead of the real
+   * hub corrects for the ball inheriting the robot's velocity at release, and for the robot
+   * continuing to travel during the ball's flight.
+   *
+   * <p>Derivation: the ball's field-relative velocity is robotVelocity + shooterExitVelocity. For
+   * it to travel from the robot to the hub T in flight time t:
+   * shooterExitVelocity * t = (T - robotPos) - robotVelocity * t, i.e. the shot must be aimed as
+   * if the target were at T - robotVelocity * t. Flight time depends on distance to that point,
+   * which depends on flight time, so this iterates a few times to converge (it converges fast:
+   * flight time changes little between passes).
+   *
+   * @param robotPose Current robot (or turret) pose
+   * @param hubPose Real hub pose
+   * @param fieldRelativeSpeeds Robot's current field-relative chassis speeds
+   * @param thetaDegrees Hood angle used to estimate flight time (band adjustments near the actual
+   *     shot are a close enough approximation for this estimate)
+   * @return The virtual hub pose to aim at
+   */
+  public static Pose2d computeVirtualHubPose(
+      Pose2d robotPose, Pose2d hubPose, ChassisSpeeds fieldRelativeSpeeds, double thetaDegrees) {
+    double vxMps = fieldRelativeSpeeds.vxMetersPerSecond;
+    double vyMps = fieldRelativeSpeeds.vyMetersPerSecond;
+    Pose2d virtualHub = hubPose;
+    for (int i = 0; i < 3; i++) {
+      double xs = getDistanceToHub(robotPose, virtualHub);
+      double t = estimateFlightTimeSeconds(xs, thetaDegrees);
+      virtualHub =
+          new Pose2d(
+              hubPose.getX() - vxMps * t, hubPose.getY() - vyMps * t, hubPose.getRotation());
+    }
+    Logger.recordOutput("Shooter/VirtualHubPose", virtualHub);
+    return virtualHub;
+  }
+
+  /**
+   * Calculates required flywheel RPS for a given hood angle.
+   *
+   * @param xs Horizontal distance to target in feet
+   * @param thetaDegrees Hood angle in degrees (e.g. 65.0)
+   * @return Required flywheel speed in Rotations Per Second (RPS)
+   */
+  public static double calculateShooterRPS(double xs, double thetaDegrees) {
+    // 1. Physical Constants
+    double wheelDiameter = 4.0 / 12.0; // 4 inch wheel converted to feet
+
+    // 2. Calculate Required Ball Exit Velocity (v)
+    double vBall = calculateExitVelocityFps(xs, thetaDegrees); // Linear ft/s
+    if (vBall <= 0) return 0.0; // Distance/angle combination is physically impossible
 
     // 3. Convert Ball Velocity to Wheel RPS
     // For a single-wheel + hood: Wheel Surface Speed = 2 * Ball Velocity
@@ -261,6 +329,33 @@ public class ShooterCommands {
         .withName("AimEverythingToHub");
   }
 
+  /**
+   * Continuously aims the turret at the hub while compensating for the robot's current
+   * field-relative velocity (shoot-on-the-move lead). Does not control the flywheel or hood.
+   */
+  public static Command AimToHubMoving(
+      Turret turret,
+      Supplier<Pose2d> poseSupplier,
+      Supplier<ChassisSpeeds> fieldSpeedsSupplier,
+      double theta,
+      LEDSubsystem led) {
+    return Commands.run(
+            () -> {
+              Pose2d rp = poseSupplier.get();
+              Pose2d hp = getAllianceHubPose();
+              Pose2d virtualHub =
+                  computeVirtualHubPose(rp, hp, fieldSpeedsSupplier.get(), theta);
+              double angleRelative = getAngleRelativeToHub(rp, virtualHub);
+              double rotations = angleRelative / (2 * Math.PI);
+              turret.setPositionPID(rotations);
+              Logger.recordOutput("test/targetTurretRotations", rotations);
+              led.setColor(LEDState.GREEN);
+            },
+            turret,
+            led)
+        .withName("turret aim moving");
+  }
+
   // Shoots while adjusting flywheel speed based on distance
   public static Command ShootFromDistance(
       LEDSubsystem led,
@@ -295,6 +390,47 @@ public class ShooterCommands {
     return Commands.deadline(
             CommandFactory.shootCommand(led, flywheel, tunnel, hopper, intake, targetRpsSupplier))
         .withName("ShootFromDistance");
+  }
+
+  /**
+   * Shoots while adjusting flywheel speed and hood based on distance to a velocity-compensated
+   * virtual hub position, so the shot lands correctly while the robot is driving. Turret aim
+   * itself is handled separately by {@link #AimToHubMoving}.
+   */
+  public static Command ShootFromDistanceMoving(
+      LEDSubsystem led,
+      Flywheel flywheel,
+      Hood hood,
+      Tunnel tunnel,
+      Hopper hopper,
+      Intake intake,
+      Supplier<Pose2d> poseSupplier,
+      Supplier<ChassisSpeeds> fieldSpeedsSupplier,
+      double theta) {
+    Supplier<Double> targetRpsSupplier =
+        () -> {
+          Pose2d rp = poseSupplier.get();
+          Pose2d hp = getAllianceHubPose();
+          Pose2d virtualHub = computeVirtualHubPose(rp, hp, fieldSpeedsSupplier.get(), theta);
+          double liveXs = getDistanceToHub(rp, virtualHub);
+          Logger.recordOutput("Shooter/Distance", liveXs);
+
+          // theta is 65
+          if (liveXs <= 10) {
+            hood.setPositionPID(theta - 5);
+            return calculateShooterRPS(liveXs, theta - 5);
+          } else if (liveXs > 15) {
+            hood.setPositionPID(theta + 5);
+            return calculateShooterRPS(liveXs, theta + 5);
+          } else {
+            hood.setPositionPID(theta);
+            return calculateShooterRPS(liveXs, theta);
+          }
+        };
+
+    return Commands.deadline(
+            CommandFactory.shootCommand(led, flywheel, tunnel, hopper, intake, targetRpsSupplier))
+        .withName("ShootFromDistanceMoving");
   }
 
   public static Command PassFromDistance(

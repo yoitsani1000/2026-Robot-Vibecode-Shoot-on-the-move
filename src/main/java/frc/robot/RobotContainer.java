@@ -319,7 +319,7 @@ public class RobotContainer {
     // driverController.lb.whileTrue(turret.moveCommand(true));
     // driverController.rb.whileTrue(turret.moveCommand(false));
     driverController.rt.whileTrue(
-        ShooterCommands.ShootFromDistance(
+        ShooterCommands.ShootFromDistanceMoving(
             led,
             flywheel,
             hood,
@@ -327,6 +327,7 @@ public class RobotContainer {
             hopper,
             intake,
             () -> drive.getTurretPose(),
+            () -> drive.getFieldRelativeChassisSpeeds(),
             softwareHoodAngleEntry.getAsDouble()));
     // driverController.lt.whileTrue(
     // ShooterCommands.ShootFromDistanceBackwardsHopper(
@@ -344,11 +345,23 @@ public class RobotContainer {
     operatorController.xButton.toggleOnTrue(
         new RunCommand(() -> flywheel.setSpeedIdle(0.25), flywheel).withName("idle flywheel"));
     operatorController.aButton.toggleOnTrue(
-        ShooterCommands.AimToHub(turret, () -> drive.getTurretPose(), led).withName("aim hub"));
+        ShooterCommands.AimToHubMoving(
+                turret,
+                () -> drive.getTurretPose(),
+                () -> drive.getFieldRelativeChassisSpeeds(),
+                softwareHoodAngleEntry.getAsDouble(),
+                led)
+            .withName("aim hub moving"));
     operatorController.yButton.whileTrue(
         ShooterCommands.AimToSide(turret, () -> drive.getPose(), led).withName("aim side"));
     driverController.rb.toggleOnTrue(
-        ShooterCommands.AimToHub(turret, () -> drive.getTurretPose(), led).withName("aim hub"));
+        ShooterCommands.AimToHubMoving(
+                turret,
+                () -> drive.getTurretPose(),
+                () -> drive.getFieldRelativeChassisSpeeds(),
+                softwareHoodAngleEntry.getAsDouble(),
+                led)
+            .withName("aim hub moving"));
     driverController.lb.toggleOnTrue(
         ShooterCommands.AimToSide(turret, () -> drive.getPose(), led).withName("aim side"));
     operatorController.lb.whileTrue(turret.moveCommand(true));
@@ -356,7 +369,7 @@ public class RobotContainer {
     operatorController.povDown.whileTrue(hood.moveCommand(false));
     operatorController.povUp.whileTrue(hood.moveCommand(true));
     operatorController.rt.whileTrue(
-        ShooterCommands.ShootFromDistance(
+        ShooterCommands.ShootFromDistanceMoving(
             led,
             flywheel,
             hood,
@@ -364,6 +377,7 @@ public class RobotContainer {
             hopper,
             intake,
             () -> drive.getTurretPose(),
+            () -> drive.getFieldRelativeChassisSpeeds(),
             softwareHoodAngleEntry.getAsDouble()));
     operatorController.lt.whileTrue(
         ShooterCommands.PassFromDistance(
